@@ -14,7 +14,7 @@
   （`LwdCloudDPEngineCore` = `LwdCloudEngineCoreMixin` + `DPEngineCoreProc`），
   完整保留 wave 状态机、dummy batch、START_DP_WAVE 与 dp×tp 专家分片；
   非 MoE 云侧跑独立引擎（`LwdCloudEngineCore`）。
-- 边侧是前端替身：用原生 DP 均衡器的评分权重路由请求，并在 wave 暂停时发
+- 边侧是前端替身：准入时路由请求（探测 preferred 直达，否则有序轮询），并在 wave 暂停时发
   FIRST_REQ 唤醒（没有别的角色会做：云侧自己没有前端流量）。
 
 一句话：把集中式 DP 部署的前端搬到边侧、把 prefill 的 embedding 环节搬到边侧，
@@ -95,7 +95,7 @@ flowchart TB
     subgraph EdgeProc["edge process"]
         EE["LwdEdgeEngineCore<br/>add_request: admit + route + announce<br/>FIRST_REQ on first admission"]
         ES["LwdEdgeScheduler<br/>one batch per step, one engine per batch"]
-        ACC["LwdCloudDpAccount x M<br/>seqno / pending / loads / gate"]
+        ACC["LwdCloudDpAccount x M<br/>seqno / pending / gate"]
         PLANE["LwdEdgeControlPlane<br/>one DEALER per link"]
         ECOORD["LwdCoordClient x M<br/>FIRST_REQ uplink, stats log"]
         EW["LwdEdgeWorker<br/>embed + unembed"]
@@ -134,7 +134,7 @@ flowchart TB
 | --- | --- | --- |
 | `LwdParallelGroupsSpec` | vllm | 两仓共用的唯一 rank 组来源 |
 | `LwdEdgeControlPlane` / `LwdEdgeTransport` | vllm | 每链路一个 DEALER、per-peer 持留、按链路索引归因 |
-| `LwdCloudDpAccount` | vllm | 一个云 DP 的边侧账本（seqno 流、pending 批、负载、闸门） |
+| `LwdCloudDpAccount` | vllm | 一个云 DP 的边侧账本（seqno 流、pending 批、闸门） |
 | `LwdEdgeScheduler` | vllm | 每步选引擎、组批、notify 出口 |
 | `LwdCloudEngineCoreMixin` + 双基座 | vllm | 云侧 LWD 接缝（ingest、参数、pre-recv MQ、c2e 刷出），基座二选一 |
 | `LwdCoordClient` | vllm | 边到 coordinator 的 FIRST_REQ 上行 |
@@ -267,7 +267,7 @@ sequenceDiagram
     participant CE as cloud engine (dp_i)
     Client->>EE: POST /chat/completions
     EE->>ES: lwd_admit_request (validate + mrope)
-    ES-->>EE: dp_idx (score 4*prefill + decode, pinned)
+    ES-->>EE: dp_idx (探测 preferred 直达，否则有序轮询; pinned)
     EE->>EE: FIRST_REQ (if wave paused)
     EE->>CE: LwdRequestNotify(dp_idx)
     EE->>CE: LwdRangeNotify(seqno_i, items)   [gate OPEN only]
@@ -285,17 +285,15 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PrefillBooks: note_prefill_admitted<br/>route pinned, +prefill_load
-    PrefillBooks --> DecodeBooks: note_prefill_done<br/>first token - membership-gated,<br/>fires exactly once per request
-    DecodeBooks --> [*]: note_request_settled<br/>finish or abort - decode_load, pop route
-    PrefillBooks --> [*]: note_request_settled<br/>abort before first token
+    [*] --> Routed: admission<br/>route pinned for life
+    Routed --> Pending: register_batch<br/>chunk batch awaiting UP send
+    Pending --> Routed: send watermark<br/>or drop_request (settle)
+    Routed --> [*]: settle (finish or abort)<br/>pop route - idempotent
 ```
 
-- 每次 token 交付都会进入清账入口（不只是首 token），所以 prefill→decode 的迁移以
-  集合成员资格为门、每请求恰好一次：纯计数器会在每个 token 上重复自减变成负数，
-  把全部流量钉死在一个引擎。
-- 路由负载包含等待请求，仅用于负载均衡。已占用槽位数以原生 `running` 队列为准；
-  请求结束或被终止时，必须同时释放原生状态并清理对应的路由账本记录。
+- 已占用槽位数以原生 `running` 队列为准，等待请求不占槽、不会挡住自己的首次
+  prefill 准入；请求结束或被终止时，必须同时释放原生状态并清理对应的路由表与
+  pending 账本记录。
 - 迟到 c2e 撞上已完结请求的 stale 分支同样清账，封住进入账本的最后一个入口。
 
 ## 调度协商：谁决定请求归谁
@@ -323,8 +321,8 @@ flowchart LR
 
 | 决策 | 归属 | 说明 |
 | --- | --- | --- |
-| 请求路由到哪个引擎 | **边** | 准入时打分（4×prefill + 1×decode，与原生 DP 负载均衡同权重）、从一而终。云侧不参与：路由变更 = 迁移 KV cache，成本远大于收益 |
-| 引擎是否可以接新活（闸门） | **边** | 边是唯一流量入口，只有它知道全局视角的每引擎负载与未消费 chunk 数。云侧各引擎只看得到自己的队列 |
+| 请求路由到哪个引擎 | **边** | 准入时选定（探测 preferred 直达，否则有序轮询）、从一而终。云侧不参与：路由变更 = 迁移 KV cache，成本远大于收益 |
+| 引擎是否可以接新活（闸门） | **边** | 边是唯一流量入口，只有它知道全局视角的每引擎 pending chunk 数与原生运行槽位。云侧各引擎只看得到自己的队列 |
 | 每步发什么批 | **边**（派发侧） | 一次一个引擎、批内引擎单一（一条 RangeNotify = 一个 seqno = 一条 UP 通道） |
 | 每步算什么批 | **云**（执行侧） | 收到 notify 后，云引擎自主决定本步混合比（decode 优先、prefill 需过三道闸门：请求已登记、UP 数据已收齐、预算充足） |
 | 引擎间步调 | **云**（原生机制） | 步末 all-reduce 只回答一个问题"还有没有任何引擎有活"，这是锁步与集体暂停的依据，不携带任何路由信息 |
@@ -355,8 +353,8 @@ flowchart TB
   数达到其限额（默认 10）时 HOLD；
 - 边侧只有一个原生调度器，运行槽位上限由所有 DP 路由共享；某个 DP 达到 pending chunk
   限额时，只阻塞该 DP；
-- 路由 `load` 不用于计算已占用运行槽位，否则等待请求会挡住自己的首次 prefill 准入。
-  选中 DP 的批次最多准入 `max_num_seqs - len(running)` 个新请求。
+- 已占用运行槽位以原生 `running` 队列计算，等待请求不会挡住自己的首次 prefill
+  准入。选中 DP 的批次最多准入 `max_num_seqs - len(running)` 个新请求。
   Host Staging 沿用当前每步 token 预算；云侧 W2 根据云侧调度器剩余预算限制 prefill。
 
 ## 云侧步（MoE DP）
@@ -486,7 +484,7 @@ gpu_memory_utilization）。
 ## 验证计划
 
 单测（CPU）：组推导（多 DP 拓扑）、多链路控制面（握手、定向发送、按链路归因、
-缺云 fail-fast）、账本与路由闸门（含负负载与完结槽位释放两个回归形态）、
+缺云 fail-fast）、账本与路由闸门（含完结槽位释放回归形态）、
 picker 回归。
 
 真机 ST（910B）两个里程碑均必须：M1 非 MoE 端到端；M2 MoE（专家跨引擎分片、
